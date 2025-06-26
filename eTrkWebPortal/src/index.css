@@ -1,0 +1,204 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
+/* Set font to Inter */
+/* Set font to Inter with Arial as fallback */
+/* Set font to Inter with Arial as fallback */
+body * {
+  font-family: 'Inter', Arial, sans-serif !important;
+}
+/* CSS for the sparkle animation */
+/* Custom styles for toast notifications */
+/* Apply gradient background to the progress bar */
+
+.sticky-header {
+  position: sticky;
+  top: 0;
+}
+
+input[type="password"]::-ms-reveal {
+  display: none;
+}
+
+
+@keyframes slideInRight {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* Animation for exiting toast notifications */
+/* Animation for entering toast notifications */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Animation for exiting toast notifications */
+@keyframes fadeOut {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.Toastify__toast--enter {
+  animation: fadeIn 0.5s ease-in-out;
+}
+
+.Toastify__toast--exit {
+  animation: fadeOut 0.5s ease-in-out;
+}
+/* Custom styles for toast notifications */
+/* Apply gradient background to the progress bar */
+
+
+
+.ms-Toggle-background[aria-checked="true"] {
+  background-color: rgb(12, 240, 12);
+}
+
+
+.ms-Toggle-background[aria-checked="false"] {
+  background-color: rgb(211, 210, 210);
+  border: none;
+}
+
+ 
+
+
+button[role='switch'] > span {
+  background-color: rgb(255, 255, 255);
+  
+}
+
+
+
+/* width */
+::-webkit-scrollbar {
+    width: 7px;
+    height: 4px;
+  }
+  
+  /* Track */
+  ::-webkit-scrollbar-track {
+    background: #f1f1f1;
+  
+  }
+  
+  /* Handle */
+  ::-webkit-scrollbar-thumb {
+    background: gainsboro;
+    border-radius: 5px;
+    opacity: 0.5;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color:rgba(190, 190, 190, 0.829);
+    opacity: 0.5;
+  }
+
+
+  .Graph{
+    font-family: sans-serif;
+    text-align: center;
+    font-size: x-small;
+    font-weight: 600;   
+}
+
+.LineGraph{
+    font-family: sans-serif;
+    text-align: center;
+    font-size: x-small;
+    font-weight: 600;
+}
+
+
+*:focus{
+  outline: none !important;
+ }
+/* Existing styles */
+.data-grid-header-cell {
+  background-color: #444791;
+  color: white;
+  font-weight: bold;
+}
+
+.table-container {
+  max-height: 10px;
+  overflow-y: auto;
+}
+.data-tables-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.5); /* Semi-transparent background overlay */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 999; /* Ensure it's above other content */
+}
+
+.popover-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  overflow: hidden;
+}
+
+.popover-header-left {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.popover-header-right {
+  margin-left: auto;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.text-170 {
+  color: #6b7280;
+}
+
+.table-container {
+  max-height: 180px; /* Set your desired height here */
+  overflow-y: auto; /* Enable vertical scrolling */
+}
+
+
+
+::-webkit-scrollbar {
+  display: block;
+}
+#names::-webkit-scrollbar
+{
+  display: none !important;
+}
+#ip::-webkit-scrollbar
+{
+  display: none !important;
+}
+
+#unlogged::-webkit-scrollbar
+{
+  display: none !important;
+}
+#video::-webkit-scrollbar
+{
+  display: none !important;
+}
+

@@ -1,0 +1,2252 @@
+-- PROCEDURE: public.calculate_app_productivity(timestamp without time zone, timestamp without time zone, text, text, text, text, text[])
+
+-- DROP PROCEDURE IF EXISTS public.calculate_app_productivity(timestamp without time zone, timestamp without time zone, text, text, text, text, text[]);
+
+CREATE OR REPLACE PROCEDURE public.calculate_app_productivity(
+	IN p_user_activity_from_date timestamp without time zone,
+	IN p_user_activity_to_date timestamp without time zone,
+	IN p_type text DEFAULT NULL::text,
+	IN p_location text DEFAULT NULL::text,
+	IN p_division text DEFAULT NULL::text,
+	IN p_project text DEFAULT NULL::text,
+	IN p_email text[] DEFAULT NULL::text[])
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    l_Application TEXT;
+    l_ActiveMinutes INTERVAL;
+    l_Productive TEXT;
+    email_id TEXT;
+	p_branch TEXT;
+	alternative_name TEXT;
+	result_row RECORD;
+	app_row RECORD;
+BEGIN
+
+-- Create a temporary table to store aggregated data
+CREATE TEMPORARY TABLE temp_aggregated_data (
+    Application TEXT,
+    ActiveMinutes INTERVAL,
+    Productive TEXT
+);
+
+FOR email_id IN SELECT UNNEST(p_email)
+LOOP       
+
+    -- Insert aggregated data into the temporary table
+    INSERT INTO temp_aggregated_data (Application, ActiveMinutes, Productive)
+    SELECT
+        CASE
+        WHEN app."ApplicationName" IS NULL OR pa."ApplicationId" IS NULL THEN 'Others'
+        ELSE COALESCE(app."ApplicationName", 'Others')
+    END AS Application,
+  
+        COALESCE(SUM(
+            CASE 
+                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 
+                THEN 0
+                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+            END
+        ) / 3600, 0) * INTERVAL '1 hour' AS ActiveMinutes,
+   
+    CASE
+        WHEN app."ApplicationName" IS NULL THEN 'false'
+        WHEN pa."Productive" THEN 'true'
+        ELSE 'false'
+    END AS Productive
+      
+    FROM (
+        SELECT 
+		
+            aa."ApplicationName" AS "Application",
+            aa."RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+            LEAD(aa."RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY aa."RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+        	FROM public."ActiveApplications" aa
+				left join public."UserDatas" ud on aa."UserActivityUserName" = ud."LocalADUserName"
+				WHERE 
+					(ud."Email" = email_id)
+					AND (p_location IS NULL OR ud."Location" = p_location OR p_location='')
+					AND (p_division IS NULL OR ud."Division" = p_division OR p_division='')
+-- 					AND (p_project IS NULL OR ud."Project" = p_project OR p_project='')
+					AND "ScreenshotPath" IS NOT NULL 
+					AND "UserActivityCurrentDateTime" >= p_user_activity_from_date 
+					AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+ 					AND EXTRACT(ISODOW FROM aa."RecordDateTime") < 6
+					AND NOT EXISTS (
+					SELECT 1
+					FROM public."Holidays" h
+					WHERE h."Date"::DATE = aa."RecordDateTime"::DATE
+					AND h."Location" = p_location
+					
+				)
+    ) AS RankedData
+
+LEFT JOIN public."ApplicationMaster" app ON LOWER(RankedData."Application") = LOWER(app."ApplicationName")
+LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId" 
+LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id" 
+WHERE
+    (
+        (p_type = 'productive' AND (pa."Productive" = TRUE OR app."ApplicationName" IS NULL)) OR
+        (p_type = 'unproductive' AND (pa."Productive" = FALSE OR app."ApplicationName" IS NULL)) OR
+        (p_type = 'all')
+    )
+       AND prj."ProjectName" = p_project
+  OR pa."ApplicationId" IS NULL
+GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId";
+	
+		
+	
+END LOOP;
+
+
+   
+-- END LOOP;
+FOR result_row IN 
+    SELECT COALESCE(am."AlternativeName", 'Others') AS Application, SUM(td.ActiveMinutes) AS TotalActiveMinutes, MAX(td.Productive) AS Productive
+    FROM temp_aggregated_data td
+    LEFT JOIN public."ApplicationMaster" am ON LOWER(td.Application) = LOWER(am."ApplicationName")
+    GROUP BY am."AlternativeName"
+LOOP
+    -- Rename loop variables to avoid ambiguity
+    l_Application := result_row.Application;
+    l_ActiveMinutes := result_row.TotalActiveMinutes;
+    l_Productive := result_row.Productive;
+
+    IF NOT (p_type = 'productive' AND l_Productive = 'false' AND l_Application = 'Others') THEN
+        RAISE NOTICE 'Application: %, ActiveMinutes: %, Productive: %',
+            l_Application,
+            TO_CHAR(l_ActiveMinutes, 'HH24:MI:SS'),
+            l_Productive;
+    END IF;
+END LOOP;
+
+-- Drop the temporary table
+DROP TABLE IF EXISTS temp_aggregated_data;
+
+END;
+$BODY$;
+ 
+------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- PROCEDURE: public.calculate_user_average_hours_project(timestamp without time zone, timestamp without time zone, text)
+
+-- DROP PROCEDURE IF EXISTS public.calculate_user_average_hours_project(timestamp without time zone, timestamp without time zone, text);
+
+CREATE OR REPLACE PROCEDURE public.calculate_user_average_hours_project(
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone,
+	p_project_id text)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+active_record RECORD;
+    ud_record RECORD;
+    date_record DATE;
+    working_hours NUMERIC;
+    productive_minutes NUMERIC;
+    non_productive_minutes NUMERIC;
+    logged_hours NUMERIC;
+    idle_hours NUMERIC;
+    adjusted_from_date timestamp without time zone;
+    adjusted_to_date timestamp without time zone;
+	reporting_emails TEXT;
+
+BEGIN
+
+ -- Adjust dates to get the full week
+    IF EXTRACT(DOW FROM p_user_activity_from_date) = 1 THEN -- If the given date is Monday
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '7 days';
+    ELSE
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '1 day' * (EXTRACT(DOW FROM p_user_activity_from_date) - 1);
+    END IF;
+    adjusted_to_date := adjusted_from_date + INTERVAL '6 days';
+
+    -- Loop through users for the specified project
+    FOR ud_record IN (
+        SELECT DISTINCT ON ("Email") "Email", "DisplayName", "ProjectId", "JobTitle", "ReportingIntoMail", "LocalADUserName"
+        FROM "UserDatas"
+        WHERE "isDelete" = false
+        AND "ProjectId" = p_project_id
+    ) LOOP
+           reporting_emails := ''; -- Initialize reporting_emails
+
+        -- Fetch reporting emails hierarchy using recursive CTE
+        WITH RECURSIVE ReportingCTE AS (
+            SELECT "Email", "ReportingIntoMail"
+            FROM "UserDatas"
+            WHERE "Email" = ud_record."Email"
+            UNION
+            SELECT ud."Email", ud."ReportingIntoMail"
+            FROM "UserDatas" ud
+            INNER JOIN ReportingCTE rc ON ud."Email" = rc."ReportingIntoMail"
+        )
+        SELECT STRING_AGG("ReportingIntoMail", ',') INTO reporting_emails
+        FROM ReportingCTE
+        WHERE "ReportingIntoMail" IS NOT NULL;
+
+        FOR date_record IN
+            SELECT generate_series(adjusted_from_date::date, adjusted_to_date::date, '1 day')::date
+        LOOP
+      
+                -- Calculate productive and non-productive minutes for the current day
+                productive_minutes := 0;
+                non_productive_minutes := 0;
+                
+                FOR active_record IN (
+                    SELECT
+                        CASE 
+                            WHEN app."ApplicationName" IS NULL THEN 'Others'
+                            ELSE COALESCE(app."ApplicationName", 'Others')
+                        END AS application_name,
+                        COALESCE(SUM(CASE
+                            WHEN app."ApplicationName" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+                            ELSE 0
+                        END) / 3600, 0) AS productive_minutes,
+                        COALESCE(SUM(CASE
+                            WHEN app."ApplicationName" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+                            ELSE 0
+                        END) / 3600, 0) AS non_productive_minutes
+                    FROM (
+                        SELECT 
+                            ActiveApplications."ApplicationName" AS "ApplicationName",
+                            CASE 
+                                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+                            END AS active_seconds,
+                            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+                        FROM (
+                            SELECT 
+                                "ApplicationName",
+                                "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                                LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                            FROM public."ActiveApplications" aa 
+                            LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" and aa."UserActivityDomainName" = ud."LocalADDomain"
+                            WHERE 
+                                (ud."Email" = ud_record."Email")
+                                AND "UserActivityCurrentDateTime" >= date_record::timestamp
+                                AND "UserActivityCurrentDateTime" < (date_record::timestamp + interval '1 day')
+                                AND "ScreenshotPath" IS NOT NULL
+                               
+                        ) AS ActiveApplications
+                    ) AS ActivityIntervals
+                    LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName") = LOWER(app."ApplicationName")
+                    LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+                    LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id"
+                    WHERE prj."Id" = ud_record."ProjectId"
+                    OR (app."ApplicationName" IS NULL)
+                    GROUP BY app."ApplicationName", pa."Productive"
+                ) LOOP
+                    IF active_record.application_name = 'Others' THEN
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    ELSE
+                        productive_minutes := productive_minutes + active_record.productive_minutes;
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    END IF;
+                END LOOP;
+
+                -- Calculate Logged Hours
+                SELECT COALESCE(SUM(CASE
+                    WHEN DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time) THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+                    ELSE 0
+                END), 0)
+                INTO logged_hours
+                FROM (
+                    SELECT 
+                        "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                        LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+                    FROM public."ActiveApplications" aa
+                    LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" AND aa."UserActivityDomainName" = ud."LocalADDomain"
+                    WHERE 
+                        (ud."Email" = ud_record."Email")
+                          AND "UserActivityCurrentDateTime" >= date_record::timestamp
+                          AND "UserActivityCurrentDateTime" < (date_record::timestamp + interval '1 day')
+                        AND "ScreenshotPath" IS NOT NULL
+                       
+                ) AS LoggedData;
+
+                -- Calculate Working Hours
+                working_hours := productive_minutes + non_productive_minutes;
+
+                -- Calculate Idle Hours
+                idle_hours := logged_hours - working_hours;
+
+                
+                -- Raise notice with user details and working hours for the current day
+                RAISE NOTICE 'Date: %, User: %, Mail: %, ReportingTo: %, WorkingHours: %, ProductiveHours: %, NonProductiveHours: %, LoggedHours: %, IdleHours: %',
+                    date_record,
+                    ud_record."DisplayName",
+                    ud_record."Email",
+					reporting_emails,
+                  TO_CHAR(INTERVAL '1 hour' * working_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * non_productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * logged_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * idle_hours, 'HH24:MI:SS');
+          
+--             END IF;
+			
+        END LOOP;
+    END LOOP;
+
+END;
+$BODY$;
+
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- PROCEDURE: public.calculate_user_consolidation_reporting(timestamp without time zone, timestamp without time zone, text)
+
+-- DROP PROCEDURE IF EXISTS public.calculate_user_consolidation_reporting(timestamp without time zone, timestamp without time zone, text);
+
+CREATE OR REPLACE PROCEDURE public.calculate_user_consolidation_reporting(
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone,
+	reporting_mail text)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+active_record RECORD;
+    ud_record RECORD;
+    date_record DATE;
+    working_hours NUMERIC;
+    productive_minutes NUMERIC;
+    non_productive_minutes NUMERIC;
+    logged_hours NUMERIC;
+    idle_hours NUMERIC;
+    adjusted_from_date timestamp without time zone;
+    adjusted_to_date timestamp without time zone;
+	
+
+BEGIN
+
+ IF EXTRACT(DOW FROM p_user_activity_from_date) = 1 THEN -- If the given date is Monday
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '7 days';
+    ELSE
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '1 day' * (EXTRACT(DOW FROM p_user_activity_from_date) - 1);
+    END IF;
+    adjusted_to_date := adjusted_from_date + INTERVAL '6 days';
+
+    FOR ud_record IN (
+        SELECT DISTINCT ON ("Email") "Email", "DisplayName", "ProjectId", "JobTitle", "ReportingIntoMail", "LocalADUserName"
+        FROM "UserDatas"
+        WHERE "isDelete" = false
+        AND "ReportingIntoMail" = reporting_mail
+    ) LOOP
+
+	
+	     
+
+      
+
+        FOR date_record IN
+            SELECT generate_series(adjusted_from_date::date, adjusted_to_date::date, '1 day')::date
+        LOOP
+      
+                -- Calculate productive and non-productive minutes for the current day
+                productive_minutes := 0;
+                non_productive_minutes := 0;
+                
+                FOR active_record IN (
+                    SELECT
+                        CASE 
+                            WHEN app."ApplicationName" IS NULL THEN 'Others'
+                            ELSE COALESCE(app."ApplicationName", 'Others')
+                        END AS application_name,
+                        COALESCE(SUM(CASE
+                            WHEN app."ApplicationName" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+                            ELSE 0
+                        END) / 3600, 0) AS productive_minutes,
+                        COALESCE(SUM(CASE
+                            WHEN app."ApplicationName" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+                            ELSE 0
+                        END) / 3600, 0) AS non_productive_minutes
+                    FROM (
+                        SELECT 
+                            ActiveApplications."ApplicationName" AS "ApplicationName",
+                            CASE 
+                                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+                            END AS active_seconds,
+                            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+                        FROM (
+                            SELECT 
+                                "ApplicationName",
+                                "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                                LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                            FROM public."ActiveApplications" aa 
+                            LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" and aa."UserActivityDomainName" = ud."LocalADDomain"
+                            WHERE 
+                                (ud."Email" = ud_record."Email")
+                                 AND "UserActivityCurrentDateTime" >= date_record::timestamp
+                         AND "UserActivityCurrentDateTime" < (date_record::timestamp + interval '1 day')
+                                AND "ScreenshotPath" IS NOT NULL
+                               
+                        ) AS ActiveApplications
+                    ) AS ActivityIntervals
+                    LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName") = LOWER(app."ApplicationName")
+                    LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+                    LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id"
+                    WHERE prj."Id" = ud_record."ProjectId"
+                    OR (app."ApplicationName" IS NULL)
+                    GROUP BY app."ApplicationName", pa."Productive"
+                ) LOOP
+                    IF active_record.application_name = 'Others' THEN
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    ELSE
+                        productive_minutes := productive_minutes + active_record.productive_minutes;
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    END IF;
+                END LOOP;
+
+                -- Calculate Logged Hours
+                SELECT COALESCE(SUM(CASE
+                    WHEN DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time) THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+                    ELSE 0
+                END), 0)
+                INTO logged_hours
+                FROM (
+                    SELECT 
+                        "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                        LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+                    FROM public."ActiveApplications" aa
+                    LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" AND aa."UserActivityDomainName" = ud."LocalADDomain"
+                    WHERE 
+                        (ud."Email" = ud_record."Email")
+                          AND "UserActivityCurrentDateTime" >= date_record::timestamp
+                         AND "UserActivityCurrentDateTime" < (date_record::timestamp + interval '1 day')
+                        AND "ScreenshotPath" IS NOT NULL
+                       
+                ) AS LoggedData;
+
+                -- Calculate Working Hours
+                working_hours := productive_minutes + non_productive_minutes;
+
+                -- Calculate Idle Hours
+                idle_hours := logged_hours - working_hours;
+
+                
+                -- Raise notice with user details and working hours for the current day
+                RAISE NOTICE 'Date: %, User: %, Mail: %, ReportingTo: %, WorkingHours: %, ProductiveHours: %, NonProductiveHours: %, LoggedHours: %, IdleHours: %',
+                    date_record,
+                    ud_record."DisplayName",
+                    ud_record."Email",
+					ud_record."ReportingIntoMail",
+                  TO_CHAR(INTERVAL '1 hour' * working_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * non_productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * logged_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * idle_hours, 'HH24:MI:SS');
+          
+--             END IF;
+			
+        END LOOP;
+-- 		 END IF;
+    END LOOP;
+END;
+$BODY$;
+
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- PROCEDURE: public.calculate_average_hours(text, text, timestamp without time zone, timestamp without time zone)
+
+-- DROP PROCEDURE IF EXISTS public.calculate_average_hours(text, text, timestamp without time zone, timestamp without time zone);
+
+CREATE OR REPLACE PROCEDURE public.calculate_average_hours(
+	p_email text[],
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone)
+LANGUAGE 'plpgsql'
+AS $BODY$
+ 
+DECLARE
+    email TEXT;
+    application_name TEXT;
+    active_minutes NUMERIC := 0;
+    working_hours NUMERIC := 0;
+    total_days NUMERIC := 0;
+    user_role TEXT;
+    p_user_activity_user_name TEXT;
+    p_user_activity_user_name2 TEXT;
+    ud_record RECORD;
+    p_branch TEXT;
+    p_location TEXT;
+	project_name TEXT;
+    is_admin BOOLEAN;
+    total_working_hours NUMERIC := 0;
+    total_working_days NUMERIC := 0;
+BEGIN
+ FOREACH email IN ARRAY p_email LOOP
+        -- Fetch user details for the current email
+        SELECT DISTINCT ON ("Email") "Email", "DisplayName", "ProjectId", "JobTitle"
+        INTO ud_record
+        FROM "UserDatas"
+        WHERE "Email" = email AND "isDelete" = false;
+  total_working_hours := 0;
+        total_days := 0;
+    -- Ensure user data was found
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'No user found with the specified email: %', p_email;
+    END IF;
+
+    -- Calculate total working hours excluding weekends and holidays
+    SELECT COALESCE(SUM(CASE
+        WHEN EXTRACT(EPOCH FROM (record_date_time - previous_time)) < 300 AND DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time)
+        THEN EXTRACT(EPOCH FROM (record_date_time - previous_time)) / 3600
+        ELSE 0
+    END), 0)
+    INTO working_hours
+    FROM (
+        SELECT 
+            "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+            LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+         FROM public."ActiveApplications" aa
+            LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" and  aa."UserActivityDomainName" = ud."LocalADDomain"
+        WHERE 
+            ud."Email" = email
+            AND "UserActivityCurrentDateTime" >= p_user_activity_from_date
+            AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+            AND EXTRACT(ISODOW FROM "UserActivityCurrentDateTime") < 6
+            AND "ScreenshotPath" IS NOT NULL 
+            AND NOT EXISTS (
+                SELECT 1
+                FROM public."Holidays" h
+                WHERE h."Date"::DATE = aa."RecordDateTime"::DATE
+                AND h."Location" = p_location
+           
+            )
+    ) AS WorkingData;
+
+    total_working_hours := total_working_hours + working_hours;
+
+    -- Calculate the number of working days excluding weekends and holidays
+    SELECT COUNT(DISTINCT DATE_TRUNC('day', dates)) INTO total_days
+    FROM generate_series(p_user_activity_from_date::date, p_user_activity_to_date::date, '1 day') AS dates
+    WHERE EXTRACT('ISODOW' FROM dates) < 6
+    AND NOT EXISTS (
+        SELECT 1
+        FROM public."Holidays" h
+        WHERE h."Date"::DATE = dates::DATE
+    );
+
+    -- Fetch the project name based on ProjectId
+    SELECT "ProjectName" INTO project_name
+    FROM "ProjectMaster"
+    WHERE "Id" = ud_record."ProjectId";
+
+    -- Calculate and display average working hours
+    RAISE NOTICE 'User: %, JobTitle: %, Team: %, WorkingHours: %',
+        ud_record."DisplayName",
+        ud_record."JobTitle",
+        project_name,
+        TO_CHAR(INTERVAL '1 hour' * (total_working_hours / total_days), 'HH24:MI:SS');
+		END LOOP;
+END;
+$BODY$;
+
+
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+-- PROCEDURE: public.calculate_combined_ipaddress_combined(timestamp without time zone, timestamp without time zone, text, text, text, text[])
+
+-- DROP PROCEDURE IF EXISTS public.calculate_combined_ipaddress_combined(timestamp without time zone, timestamp without time zone, text, text, text, text[]);
+
+CREATE OR REPLACE PROCEDURE public.calculate_combined_ipaddress_combined(
+	IN p_from_date timestamp without time zone,
+	IN p_to_date timestamp without time zone,
+	IN p_location text DEFAULT NULL::text,
+	IN p_division text DEFAULT NULL::text,
+	IN p_project text DEFAULT NULL::text,
+	IN p_email text[] DEFAULT NULL::text[])
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    email_id TEXT;
+    p_user_activity_user_name TEXT;
+    display_name TEXT;
+    ip_address_info RECORD;
+BEGIN
+    FOR email_id IN SELECT UNNEST(p_email)
+    LOOP
+  
+    SELECT ud."LocalADUserName",ud."DisplayName"
+        INTO p_user_activity_user_name,display_name
+        FROM public."UserDatas" ud
+        WHERE ud."Email" = email_id;
+
+        FOR ip_address_info IN
+            SELECT ia."IPAddress", ia."UserName", ia."RecordDateTime"
+            FROM public."IPAddresses" ia
+            JOIN public."UserDatas" ud ON (ia."UserName" = ud."LocalADUserName")
+            WHERE ud."Email" = email_id
+                AND (p_from_date IS NULL OR ia."RecordDateTime" >= p_from_date)
+                AND (p_to_date IS NULL OR ia."RecordDateTime" <= p_to_date)
+  
+        LOOP
+            RAISE NOTICE 'IP Address: %, User Name: %, DisplayName: %, Record Date Time: %',
+                ip_address_info."IPAddress",
+                ip_address_info."UserName",
+				display_name,
+                ip_address_info."RecordDateTime";
+        END LOOP;
+    END LOOP;
+END;
+$BODY$;
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- PROCEDURE: public.calculate_employee_comparison(timestamp without time zone, timestamp without time zone, text[])
+
+-- DROP PROCEDURE IF EXISTS public.calculate_employee_comparison(timestamp without time zone, timestamp without time zone, text[]);
+
+CREATE OR REPLACE PROCEDURE public.calculate_employee_comparison(
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone,
+	p_email text[] DEFAULT NULL::text[])
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    active_record RECORD;
+    application_name TEXT;
+    productive_mapping BOOLEAN;
+    active_minutes NUMERIC := 0;
+    productive_minutes NUMERIC := 0;
+    non_productive_minutes NUMERIC := 0;
+    logged_hours NUMERIC := 0;
+    working_hours NUMERIC := 0;
+    idle_hours NUMERIC := 0;
+    p_user_activity_user_name TEXT;
+    p_user_activity_user_name2 TEXT;
+    email_id TEXT;
+    p_displayname TEXT;
+p_location TEXT;
+p_branch TEXT;
+p_project TEXT;
+
+  total_percentage NUMERIC := 0;
+    productive_percentage NUMERIC := 0;
+    non_productive_percentage NUMERIC := 0;
+    logged_percentage NUMERIC := 0;
+    idle_percentage NUMERIC := 0;
+    working_percentage NUMERIC := 0;
+BEGIN
+    FOR email_id IN SELECT UNNEST(p_email)
+    LOOP
+        -- Initialize user-specific metrics to zero for each iteration
+        active_minutes := 0;
+        productive_minutes := 0;
+        non_productive_minutes := 0;
+        logged_hours := 0;
+        working_hours := 0;
+        idle_hours := 0;
+ 
+
+ SELECT ud."DisplayName", prj."ProjectName"
+    INTO p_displayname, p_project
+    FROM public."UserDatas" ud
+    LEFT JOIN public."ProjectMaster" prj ON ud."ProjectId" = prj."Id"
+    WHERE ud."Email" = email_id;
+ 
+ FOR active_record IN (
+  SELECT
+   CASE 
+        WHEN app."ApplicationName" IS NULL OR pa."ApplicationId" IS NULL THEN 'Others'
+        ELSE COALESCE(app."ApplicationName", 'Others')
+    END AS application_name,
+    COALESCE(SUM(CASE
+        WHEN pa."ApplicationId" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+        ELSE 0
+    END) / 3600, 0) AS productive_minutes,
+    COALESCE(SUM(CASE
+        WHEN pa."ApplicationId" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+        ELSE 0
+    END) / 3600, 0) AS non_productive_minutes
+    FROM (
+            SELECT 
+          ActiveApplications."ApplicationName" AS "ApplicationName",
+            CASE 
+                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+            END AS active_seconds,
+            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+            FROM (
+                SELECT 
+                    "ApplicationName",
+                    "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                    LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                FROM public."ActiveApplications" aa 
+                LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"  and aa."UserActivityDomainName" = ud."LocalADDomain"
+                WHERE 
+                    (ud."Email" = email_id)
+
+                    AND "UserActivityCurrentDateTime" >= p_user_activity_from_date
+                    AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+                    AND "ScreenshotPath" IS NOT NULL -- Filter by binary data in Screenshot column
+            ) AS ActiveApplications
+    ) AS ActivityIntervals
+ 
+    LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName") = LOWER(app."ApplicationName") 
+        LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+        LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id" 
+        WHERE prj."ProjectName" = p_project
+  OR pa."ApplicationId" IS NULL
+GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId"
+
+) LOOP
+   
+    IF active_record.application_name = 'Others' THEN
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    ELSE
+        productive_minutes := productive_minutes + active_record.productive_minutes;
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    END IF;
+END LOOP;
+
+ 
+        -- Calculate logged hours
+        SELECT COALESCE(SUM(CASE
+            WHEN DATE(record_date_time AT TIME ZONE 'UTC') = DATE(previous_time AT TIME ZONE 'UTC') THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+            ELSE 0
+        END), 0)
+        INTO logged_hours
+        FROM (
+            SELECT 
+                "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+            FROM public."ActiveApplications" aa
+            left join public."UserDatas" ud on aa."UserActivityUserName" = ud."LocalADUserName"  and aa."UserActivityDomainName" = ud."LocalADDomain"
+WHERE 
+(ud."Email" = email_id)
+AND "UserActivityCurrentDateTime" >= p_user_activity_from_date
+AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+AND "ScreenshotPath" IS NOT NULL -- Filter by binary data in Screenshot column
+
+AND NOT EXISTS (
+SELECT 1
+FROM public."Holidays" h
+WHERE h."Date"::DATE = "RecordDateTime"::DATE
+AND h."Location" = p_location
+AND h."Branch" = p_branch
+)
+        ) AS LoggedData;
+ 
+        working_hours := productive_minutes + non_productive_minutes; -- Calculate Working Hours
+        idle_hours := logged_hours - working_hours; -- Calculate Idle hours
+
+ 
+
+            RAISE NOTICE 'User: %, Logged Hours: %, Idle Hours: %, Working Hours: %, Productive Minutes: %, NonProductive Minutes: %',
+            p_displayname,
+            TO_CHAR(logged_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+            TO_CHAR(idle_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+            TO_CHAR(working_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+            TO_CHAR(productive_minutes * INTERVAL '1 hour', 'HH24:MI:SS'),
+            TO_CHAR(non_productive_minutes * INTERVAL '1 hour', 'HH24:MI:SS');
+    END LOOP;
+ 
+END;
+
+$BODY$;
+
+
+
+
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+-- PROCEDURE: public.calculate_holiday_summary(timestamp without time zone, timestamp without time zone, text, text, text, text[])
+
+-- DROP PROCEDURE IF EXISTS public.calculate_holiday_summary(timestamp without time zone, timestamp without time zone, text, text, text, text[]);
+
+CREATE OR REPLACE PROCEDURE public.calculate_holiday_summary(
+	IN p_user_activity_from_date timestamp without time zone,
+	IN p_user_activity_to_date timestamp without time zone,
+	IN p_location text DEFAULT NULL::text,
+	IN p_division text DEFAULT NULL::text,
+	IN p_project text DEFAULT NULL::text,
+	IN p_email text[] DEFAULT NULL::text[])
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+  
+    active_record RECORD;
+    email_id TEXT;
+    productive_minutes NUMERIC := 0;
+    non_productive_minutes NUMERIC := 0;
+    logged_hours NUMERIC := 0;
+    working_hours NUMERIC := 0;
+    idle_hours NUMERIC := 0;
+    total_productive_hours NUMERIC := 0;
+    total_non_productive_hours NUMERIC := 0;
+    total_logged_hours NUMERIC := 0;
+    total_working_hours NUMERIC := 0;
+    total_idle_hours NUMERIC := 0;
+    matched_date_value DATE;
+    matched_dates_array DATE[];
+    p_displayname TEXT;
+	
+BEGIN
+
+    FOR email_id IN SELECT UNNEST(p_email) LOOP
+	
+	   
+
+        CREATE TEMP TABLE MatchedDates(date_value DATE);
+
+
+         INSERT INTO MatchedDates(date_value)
+        SELECT d::DATE
+        FROM generate_series(p_user_activity_from_date::DATE, p_user_activity_to_date::DATE, interval '1 day') AS d
+        WHERE EXTRACT(ISODOW FROM d) IN (6, 7); 
+        -- Insert matching dates from Holidays table
+        INSERT INTO MatchedDates(date_value)
+        SELECT DISTINCT h."Date"::DATE
+        FROM public."UserDatas" ud
+        JOIN public."Holidays" h ON 
+            ud."Location" = ANY (string_to_array(h."Location", ',')) AND
+            ud."Branch" = ANY (string_to_array(h."Branch", ','))
+        WHERE ud."Email" = email_id
+        AND h."Date" BETWEEN p_user_activity_from_date::DATE AND (p_user_activity_to_date::DATE + INTERVAL '1 day');
+
+        SELECT ARRAY_AGG(date_value ORDER BY date_value)
+            INTO matched_dates_array
+            FROM MatchedDates;
+
+        IF array_length(matched_dates_array, 1) IS NULL THEN
+            RAISE NOTICE 'No holidays or weekends found in the given date range for email: %.', email_id;
+        ELSE
+            FOREACH matched_date_value IN ARRAY matched_dates_array LOOP 
+             FOR active_record IN (
+      SELECT
+   CASE 
+        WHEN app."ApplicationName" IS NULL OR pa."ApplicationId" IS NULL THEN 'Others'
+        ELSE COALESCE(app."ApplicationName", 'Others')
+    END AS application_name,
+    COALESCE(SUM(CASE
+        WHEN pa."ApplicationId" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+        ELSE 0
+    END) / 3600, 0) AS productive_minutes,
+    COALESCE(SUM(CASE
+        WHEN pa."ApplicationId" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+        ELSE 0
+    END) / 3600, 0) AS non_productive_minutes,
+
+    COALESCE(SUM(CASE
+        WHEN app."ApplicationName" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+        ELSE 0
+    END) / 3600, 0) AS non_productive_minutes
+    FROM (
+         SELECT 
+          ActiveApplications."ApplicationName" AS "ApplicationName", 
+          
+            CASE 
+                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+            END AS active_seconds,
+            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+            FROM (
+                SELECT 
+                    "ApplicationName",
+                    "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                    LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                FROM public."ActiveApplications" aa 
+                LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"
+                WHERE 
+                  
+					(ud."Email" = email_id) AND
+                    "UserActivityCurrentDateTime" >= p_user_activity_from_date AND         
+                    "UserActivityCurrentDateTime" <= p_user_activity_to_date
+                    AND "ScreenshotPath" IS NOT NULL -- Filter by binary data in Screenshot column
+                    AND DATE("UserActivityCurrentDateTime") = matched_date_value -- Filter by matched date -- Filter by matched date
+            ) AS ActiveApplications
+    ) AS ActivityIntervals
+ 
+	   LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName")= LOWER(app."ApplicationName")
+        LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+        LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id" 
+        WHERE prj."ProjectName" = p_project
+	OR pa."ApplicationId" IS NULL
+GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId"
+	
+) LOOP
+   
+    IF active_record.application_name = 'Others' THEN
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    ELSE
+        productive_minutes := productive_minutes + active_record.productive_minutes;
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    END IF;
+END LOOP;
+
+                SELECT COALESCE(SUM(CASE
+                        WHEN DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time) THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+                    ELSE 0
+                    END), 0)
+                    INTO logged_hours
+                    FROM (
+                        SELECT 
+                            "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                            LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+                        FROM public."ActiveApplications" aa
+                        LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"
+                        WHERE 
+                            ud."Email" = email_id AND
+                            (p_location IS NULL OR ud."Location" = p_location OR p_location='') AND
+                            (p_division IS NULL OR ud."Division" = p_division OR p_division='') AND
+                            --(p_project IS NULL OR ud."Project" = p_project OR p_project='') AND
+                            "UserActivityCurrentDateTime" >= p_user_activity_from_date AND         
+                            "UserActivityCurrentDateTime" <= p_user_activity_to_date AND
+                            "ScreenshotPath" IS NOT NULL AND
+                            DATE("UserActivityCurrentDateTime") = matched_date_value
+                    ) AS LoggedData;
+
+                working_hours := productive_minutes + non_productive_minutes;
+                idle_hours := logged_hours - working_hours;
+
+                SELECT "DisplayName" INTO p_displayname FROM public."UserDatas" WHERE "Email" = email_id;
+
+                RAISE NOTICE 'Metrics for date: %, Day: %, Display Name: %, Productive Hours: %, Non-Productive Hours: %, Logged Hours: %, Working Hours: %, Idle Hours: %',
+                    matched_date_value,
+					TO_CHAR(matched_date_value,'Day'),
+					p_displayname,
+                    TO_CHAR(INTERVAL '1 hour' * productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * non_productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * logged_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * working_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * idle_hours, 'HH24:MI:SS');
+
+                total_productive_hours := total_productive_hours + productive_minutes;
+                total_non_productive_hours := total_non_productive_hours + non_productive_minutes;
+                total_logged_hours := total_logged_hours + logged_hours;
+                total_working_hours := total_working_hours + working_hours;
+                total_idle_hours := total_idle_hours + idle_hours;
+
+             -- Reset the metrics for the next iteration
+                productive_minutes := 0;
+                non_productive_minutes := 0;
+                logged_hours := 0;
+                working_hours := 0;
+                idle_hours := 0;
+
+            END LOOP;
+
+        END IF;
+
+        -- Drop the temporary table
+        DROP TABLE IF EXISTS MatchedDates;
+
+    END LOOP;
+
+    RAISE NOTICE 'Total Productive Hours: %, Total Non-Productive Hours: %, Total Logged Hours: %, Total Working Hours: %, Total Idle Hours: %',
+        TO_CHAR(INTERVAL '1 hour' * total_productive_hours, 'HH24:MI:SS'),
+        TO_CHAR(INTERVAL '1 hour' * total_non_productive_hours, 'HH24:MI:SS'),
+        TO_CHAR(INTERVAL '1 hour' * total_logged_hours, 'HH24:MI:SS'),
+        TO_CHAR(INTERVAL '1 hour' * total_working_hours, 'HH24:MI:SS'),
+        TO_CHAR(INTERVAL '1 hour' * total_idle_hours, 'HH24:MI:SS');
+
+END;
+$BODY$;
+
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- PROCEDURE: public.calculate_login_pattern(text, timestamp without time zone, timestamp without time zone)
+
+-- DROP PROCEDURE IF EXISTS public.calculate_login_pattern(text, timestamp without time zone, timestamp without time zone);
+
+CREATE OR REPLACE PROCEDURE public.calculate_login_pattern(
+	IN p_email text,
+	IN p_user_activity_from_date timestamp without time zone,
+	IN p_user_activity_to_date timestamp without time zone)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    p_user_activity_user_name text;
+    v_login_time TIMESTAMP;
+    v_logout_time TIMESTAMP;
+	email_id TEXT;
+    p_user_activity_user_name2 TEXT;
+    loop_date DATE := p_user_activity_from_date;
+	p_display_name text;
+BEGIN
+	SELECT ud."DisplayName"
+    INTO p_display_name
+    FROM public."UserDatas" ud
+        WHERE ud."Email" = p_email;
+
+  WHILE loop_date <= p_user_activity_to_date LOOP
+        -- Retrieve login time
+        SELECT MIN("RecordDateTime")
+        INTO v_login_time
+        FROM public."ActiveApplications"
+        WHERE
+            "UserActivityCurrentDateTime" >= loop_date
+            AND "UserActivityCurrentDateTime" < (loop_date + INTERVAL '1 day')
+            AND "ScreenshotPath" IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM public."UserDatas" ud
+                WHERE ud."Email" = p_email
+                    AND "ActiveApplications"."UserActivityUserName" = ud."LocalADUserName"
+            );
+
+        -- Retrieve logout time
+        SELECT MAX("RecordDateTime")
+        INTO v_logout_time
+        FROM public."ActiveApplications" aa
+        LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"
+        WHERE
+            (ud."Email" = p_email)
+            AND "UserActivityCurrentDateTime" >= loop_date
+            AND "UserActivityCurrentDateTime" < (loop_date + INTERVAL '1 day')
+            AND "ScreenshotPath" IS NOT NULL;
+
+        IF v_login_time IS NULL THEN
+            v_login_time := loop_date;
+        END IF;
+        IF v_logout_time IS NULL THEN
+            v_logout_time := loop_date;
+        END IF;
+
+        RAISE NOTICE 'Date: %, Username: %, LoggedInTime: %, LoggedOutTime: %',
+            loop_date, p_display_name, TO_CHAR(v_login_time, 'HH24:MI:SS'), TO_CHAR(v_logout_time, 'HH24:MI:SS');
+
+        loop_date := loop_date + INTERVAL '1 day';
+    END LOOP;
+	 
+END;
+$BODY$;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- PROCEDURE: public.calculate_work_summary(timestamp without time zone, timestamp without time zone, text, text, text, text[])
+
+-- DROP PROCEDURE IF EXISTS public.calculate_work_summary(timestamp without time zone, timestamp without time zone, text, text, text, text[]);
+
+CREATE OR REPLACE PROCEDURE public.calculate_work_summary(
+	IN p_user_activity_from_date timestamp without time zone,
+	IN p_user_activity_to_date timestamp without time zone,
+	IN p_location text DEFAULT NULL::text,
+	IN p_division text DEFAULT NULL::text,
+	IN p_project text DEFAULT NULL::text,
+	IN p_email text[] DEFAULT NULL::text[])
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    active_record RECORD;
+    application_name TEXT;
+    productive_mapping BOOLEAN;
+    active_minutes NUMERIC := 0;
+    productive_minutes NUMERIC := 0;
+    non_productive_minutes NUMERIC := 0;
+    logged_hours NUMERIC := 0;
+    working_hours NUMERIC := 0;
+    idle_hours NUMERIC := 0;
+    total_productive_hours NUMERIC := 0;
+    total_non_productive_hours NUMERIC := 0;
+    total_logged_hours NUMERIC := 0;
+    total_working_hours NUMERIC := 0;
+    total_idle_hours NUMERIC := 0;
+    p_user_activity_user_name TEXT;
+    p_user_activity_user_name2 TEXT;
+    email_id TEXT;
+    p_JobTitle TEXT;
+    p_displayname TEXT;
+    time_diff INTERVAL;
+    loop_start timestamp without time zone;
+    loop_end timestamp without time zone;
+    loop_increment INTERVAL;
+--     week_start timestamp without time zone;
+    week_start DATE := p_user_activity_from_date;
+ 
+BEGIN
+   time_diff := p_user_activity_to_date - p_user_activity_from_date;
+ 
+    IF time_diff <= interval '30 days' THEN
+        -- Handle 31 days or less
+        loop_start := p_user_activity_from_date;
+        loop_end := p_user_activity_to_date;
+        loop_increment := interval '1 day';
+    ELSE
+        loop_start := date_trunc('month', p_user_activity_from_date);
+        loop_end := p_user_activity_to_date;
+        loop_increment := interval '1 month';
+    END IF;
+    WHILE loop_start <= loop_end LOOP
+	 IF EXTRACT(ISODOW FROM loop_start) IN (6, 7) OR EXISTS (
+			SELECT 1
+			FROM public."Holidays" h
+			WHERE h."Date"::DATE = loop_start::DATE
+		) THEN
+			loop_start := loop_start + interval '1 day'; -- Move to the next day
+			CONTINUE; 
+	 END IF;
+
+		
+		IF loop_increment = interval '1 day' THEN
+            week_start := loop_start - EXTRACT(DOW FROM loop_start - INTERVAL '1 day') * INTERVAL '1 day';
+            p_user_activity_from_date := loop_start;
+            p_user_activity_to_date := loop_start + interval '1 day' - interval '1 second';
+        ELSE
+            week_start := loop_start;
+            p_user_activity_from_date := week_start;
+            p_user_activity_to_date := week_start + interval '30 days' - interval '1 second';
+        END IF;
+		IF loop_increment = interval '1 month' THEN
+			week_start := loop_start;
+			p_user_activity_from_date := date_trunc('month', loop_start);
+			p_user_activity_to_date := date_trunc('month', loop_start) + interval '1 month' - interval '1 second';
+-- 			p_user_activity_to_date := date_trunc('month', loop_start + interval '1 month' - interval '1 second') + interval '1 day' - interval '1 second';
+		END IF;
+    FOR email_id IN SELECT UNNEST(p_email)
+    LOOP       
+        active_minutes := 0;
+        productive_minutes := 0;
+        non_productive_minutes := 0;
+        logged_hours := 0;
+        working_hours := 0;
+        idle_hours := 0;
+		SELECT 
+		ud."DisplayName", 
+		ud."JobTitle"
+		INTO 
+			p_displayname, 
+			p_JobTitle
+		FROM 
+			public."UserDatas" ud
+		WHERE 
+			ud."Email" = email_id;
+			
+			FOR active_record IN (
+		   SELECT
+		   CASE 
+		        WHEN app."ApplicationName" IS NULL OR pa."ApplicationId" IS NULL THEN 'Others'
+		        ELSE COALESCE(app."ApplicationName", 'Others')
+		    END AS application_name,
+		    COALESCE(SUM(CASE
+		        WHEN pa."ApplicationId" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+		        ELSE 0
+		    END) / 3600, 0) AS productive_minutes,
+		    COALESCE(SUM(CASE
+		        WHEN pa."ApplicationId" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+		        ELSE 0
+		    END) / 3600, 0) AS non_productive_minutes
+    FROM (
+        
+            SELECT 
+          ActiveApplications."ApplicationName" AS "ApplicationName",
+            CASE 
+                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+            END AS active_seconds,
+            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+            FROM (
+                SELECT 
+                    "ApplicationName",
+                    "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                    LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                FROM public."ActiveApplications" aa 
+                LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"
+                WHERE 
+                    (ud."Email" = email_id)
+                    AND (p_location IS NULL OR ud."Location" = p_location OR p_location='')
+                    AND (p_division IS NULL OR ud."Division" = p_division OR p_division='')
+                   -- AND (p_project IS NULL OR ud."Project" = p_project OR p_project='')
+                    AND "UserActivityCurrentDateTime" >= p_user_activity_from_date
+                    AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+                    AND "ScreenshotPath" IS NOT NULL -- Filter by binary data in Screenshot column
+				AND EXTRACT(ISODOW FROM "UserActivityCurrentDateTime") < 6
+            ) AS ActiveApplications
+    ) AS ActivityIntervals
+ 
+	  LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName") = LOWER(app."ApplicationName") 
+        LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+        LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id" 
+        WHERE prj."ProjectName" = p_project
+	OR pa."ApplicationId" IS NULL
+GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId"
+	
+) LOOP
+   
+    IF active_record.application_name = 'Others' THEN
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    ELSE
+        productive_minutes := productive_minutes + active_record.productive_minutes;
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    END IF;
+END LOOP;
+
+		--Calculate Logged Hours
+		SELECT COALESCE(SUM(CASE
+			WHEN DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time) THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+			ELSE 0
+		END), 0)
+		INTO logged_hours
+		FROM (
+			 SELECT 
+			"RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+			LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+		FROM public."ActiveApplications" aa
+					left join public."UserDatas" ud on aa."UserActivityUserName" = ud."LocalADUserName"
+					WHERE 
+					(ud."Email" = email_id)
+					AND (p_location IS NULL OR ud."Location" = p_location OR p_location='')
+					AND (p_division IS NULL OR ud."Division" = p_division OR p_division='')
+-- 					AND (p_project IS NULL OR ud."Project" = p_project OR p_project='')
+					AND "UserActivityCurrentDateTime" >= p_user_activity_from_date
+					AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+					AND "ScreenshotPath" IS NOT NULL -- Filter by binary data in Screenshot column
+			AND EXTRACT(ISODOW FROM "UserActivityCurrentDateTime") < 6
+
+		) AS LoggedData;
+		working_hours := productive_minutes + non_productive_minutes;--Calculate Working Hours
+		idle_hours := logged_hours - working_hours ;--calculate Idle hours
+	
+				total_productive_hours := total_productive_hours + productive_minutes;
+				total_non_productive_hours := total_non_productive_hours + non_productive_minutes;
+				total_logged_hours := total_logged_hours + logged_hours;
+				total_working_hours := total_working_hours + working_hours;
+				total_idle_hours := total_idle_hours + idle_hours;
+
+			 RAISE NOTICE 'User: %, JobTitle: %, Date: %, Logged Hours: %, Idle Hours: %, Working Hours: %, Productive Minutes: %, NonProductive Minutes: %',
+					p_displayname,
+					p_JobTitle,
+					loop_start,
+					TO_CHAR(logged_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+					TO_CHAR(idle_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+					TO_CHAR(working_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+					TO_CHAR(productive_minutes * INTERVAL '1 hour', 'HH24:MI:SS'),
+					TO_CHAR(non_productive_minutes * INTERVAL '1 hour', 'HH24:MI:SS');
+
+	  END LOOP;
+     loop_start := loop_start + loop_increment; 
+END LOOP; 
+RAISE NOTICE 'Total Productive Hours: %, Total Non-Productive Hours: %, Total Logged Hours: %, Total Working Hours: %, Total Idle Hours: %',
+    TO_CHAR(total_productive_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+    TO_CHAR(total_non_productive_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+    TO_CHAR(total_logged_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+    TO_CHAR(total_working_hours * INTERVAL '1 hour', 'HH24:MI:SS'),
+    TO_CHAR(total_idle_hours * INTERVAL '1 hour', 'HH24:MI:SS');
+END;  
+$BODY$;
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- PROCEDURE: public.calculate_work_summary_graphs(timestamp without time zone, timestamp without time zone, text, text, text, text[])
+
+-- DROP PROCEDURE IF EXISTS public.calculate_work_summary_graphs(timestamp without time zone, timestamp without time zone, text, text, text, text[]);
+
+CREATE OR REPLACE PROCEDURE public.calculate_work_summary_graphs(
+	IN p_user_activity_from_date timestamp without time zone,
+	IN p_user_activity_to_date timestamp without time zone,
+	IN p_location text DEFAULT NULL::text,
+	IN p_division text DEFAULT NULL::text,
+	IN p_project text DEFAULT NULL::text,
+	IN p_email text[] DEFAULT NULL::text[])
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    application_name TEXT;
+    active_minutes NUMERIC := 0;
+    productive_mapping BOOLEAN;
+    productive_minutes NUMERIC := 0;
+    non_productive_minutes NUMERIC := 0;
+    logged_hours NUMERIC := 0;
+    working_hours NUMERIC := 0;
+    idle_hours NUMERIC := 0;
+    total_logged_hours NUMERIC := 0;
+    total_working_hours NUMERIC := 0;
+    total_idle_hours NUMERIC := 0;
+    total_productive_minutes NUMERIC := 0;
+    total_non_productive_minutes NUMERIC := 0;
+  
+    email_id TEXT;
+    active_record RECORD;
+	 time_diff INTERVAL;
+    loop_start timestamp without time zone;
+    loop_end timestamp without time zone;
+    loop_increment INTERVAL;
+--     week_start timestamp without time zone;
+week_start DATE := p_user_activity_from_date;
+	 loop_end_date DATE;
+BEGIN
+
+ time_diff := p_user_activity_to_date - p_user_activity_from_date;
+ 
+    IF time_diff <= interval '30 days' THEN
+        -- Handle 31 days or less
+        loop_start := p_user_activity_from_date;
+        loop_end := p_user_activity_to_date;
+        loop_increment := interval '1 day';
+    ELSE
+        loop_start := date_trunc('month', p_user_activity_from_date);
+        loop_end := p_user_activity_to_date;
+        loop_increment := interval '1 month';
+    END IF;
+    WHILE loop_start <= loop_end LOOP
+	 IF EXTRACT(ISODOW FROM loop_start) IN (6, 7) OR EXISTS (
+			SELECT 1
+			FROM public."Holidays" h
+			WHERE h."Date"::DATE = loop_start::DATE
+		) THEN
+			loop_start := loop_start + interval '1 day'; -- Move to the next day
+			CONTINUE; 
+	 END IF;
+
+		
+		IF loop_increment = interval '1 day' THEN
+            week_start := loop_start - EXTRACT(DOW FROM loop_start - INTERVAL '1 day') * INTERVAL '1 day';
+            p_user_activity_from_date := loop_start;
+            p_user_activity_to_date := loop_start + interval '1 day' - interval '1 second';
+        ELSE
+            week_start := loop_start;
+            p_user_activity_from_date := week_start;
+            p_user_activity_to_date := week_start + interval '30 days' - interval '1 second';
+        END IF;
+		IF loop_increment = interval '1 month' THEN
+			week_start := loop_start;
+			p_user_activity_from_date := date_trunc('month', loop_start);
+-- 			p_user_activity_to_date := date_trunc('month', loop_start + interval '1 month' - interval '1 second') + interval '1 day' - interval '1 second';
+             p_user_activity_to_date := date_trunc('month', loop_start) + interval '1 month' - interval '1 second';
+		END IF;
+       
+            -- Filter users based on location, division, project, and username if provided
+            FOR email_id IN SELECT UNNEST(p_email)
+            LOOP
+                productive_minutes := 0; -- Reset for each user
+                non_productive_minutes := 0; -- Reset for each user
+
+                   
+				        FOR active_record IN (
+  SELECT
+   CASE 
+        WHEN app."ApplicationName" IS NULL OR pa."ApplicationId" IS NULL THEN 'Others'
+        ELSE COALESCE(app."ApplicationName", 'Others')
+    END AS application_name,
+    COALESCE(SUM(CASE
+        WHEN pa."ApplicationId" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+        ELSE 0
+    END) / 3600, 0) AS productive_minutes,
+    COALESCE(SUM(CASE
+        WHEN pa."ApplicationId" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+        ELSE 0
+    END) / 3600, 0) AS non_productive_minutes
+    FROM (
+        SELECT 
+                   
+          ActiveApplications."ApplicationName" AS "ApplicationName",
+            CASE 
+                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+            END AS active_seconds,
+            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+            FROM (
+                SELECT 
+                    "ApplicationName",
+                    "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                    LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                FROM public."ActiveApplications" aa 
+                LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"
+                WHERE 
+                    (ud."Email" = email_id)
+                    AND (p_location IS NULL OR ud."Location" = p_location OR p_location='')
+                    AND (p_division IS NULL OR ud."Division" = p_division OR p_division='')
+                    --AND (p_project IS NULL OR ud."Project" = p_project OR p_project='')
+                    AND "UserActivityCurrentDateTime" >= p_user_activity_from_date
+                    AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+                    AND "ScreenshotPath" IS NOT NULL -- Filter by binary data in Screenshot column
+				AND EXTRACT(ISODOW FROM "UserActivityCurrentDateTime") < 6
+            ) AS ActiveApplications
+    ) AS ActivityIntervals
+ 
+	 LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName") = LOWER(app."ApplicationName") 
+        LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+        LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id" 
+        WHERE prj."ProjectName" = p_project
+	OR pa."ApplicationId" IS NULL
+      GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId"
+	
+	
+) LOOP
+   
+    IF active_record.application_name = 'Others' THEN
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    ELSE
+        productive_minutes := productive_minutes + active_record.productive_minutes;
+        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+    END IF;
+   END LOOP;
+
+                -- Calculate logged hours
+                SELECT COALESCE(SUM(CASE
+                        WHEN DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time) THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+                        ELSE 0
+                    END), 0) -- Use COALESCE to handle NULL values
+                INTO logged_hours
+                FROM (
+                    SELECT 
+                        "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                        LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+                    FROM public."ActiveApplications" aa
+						left join public."UserDatas" ud on aa."UserActivityUserName" = ud."LocalADUserName"
+						WHERE 
+						(ud."Email" = email_id)
+						AND (p_location IS NULL OR ud."Location" = p_location OR p_location='')
+						AND (p_division IS NULL OR ud."Division" = p_division OR p_division='')
+-- 						AND (p_project IS NULL OR ud."Project" = p_project OR p_project='')
+						AND "UserActivityCurrentDateTime" >= p_user_activity_from_date
+					AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+						AND "ScreenshotPath" IS NOT NULL -- Filter by binary data in Screenshot column
+					AND EXTRACT(ISODOW FROM "UserActivityCurrentDateTime") < 6
+                ) AS RankedData;
+
+                working_hours := productive_minutes + non_productive_minutes; -- Calculate Working Hours
+                idle_hours := logged_hours - working_hours; -- Calculate Idle hours
+
+                total_logged_hours := total_logged_hours + logged_hours;
+                total_working_hours := total_working_hours + working_hours;
+                total_idle_hours := total_idle_hours + idle_hours;
+                total_productive_minutes := total_productive_minutes + productive_minutes;
+                total_non_productive_minutes := total_non_productive_minutes + non_productive_minutes;
+
+         END LOOP;
+          
+            RAISE NOTICE 'Date: %, Total Logged Hours: %, Total Idle Hours: %, Total Working Hours: %, Total Productive Minutes: %, Total NonProductive Minutes: %', 
+                  TO_CHAR(loop_start, 'YYYY-MM-DD'), 
+                TO_CHAR(total_logged_hours * INTERVAL '1 hour', 'HH24:MI:SS'), 
+                TO_CHAR(total_idle_hours * INTERVAL '1 hour', 'HH24:MI:SS'), 
+                TO_CHAR(total_working_hours * INTERVAL '1 hour', 'HH24:MI:SS'), 
+                TO_CHAR(total_productive_minutes * INTERVAL '1 hour', 'HH24:MI:SS'), 
+                TO_CHAR(total_non_productive_minutes * INTERVAL '1 hour', 'HH24:MI:SS');
+
+            -- Reset variables for the next date
+            total_logged_hours := 0;
+            total_working_hours := 0;
+            total_idle_hours := 0;
+            total_productive_minutes := 0;
+            total_non_productive_minutes := 0;
+
+          
+           loop_start := loop_start + loop_increment; 
+		
+    END LOOP;
+END;
+$BODY$;
+
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- PROCEDURE: public.calculate_app_productivity_name(timestamp without time zone, timestamp without time zone, text, text, text, text, text[])
+
+-- DROP PROCEDURE IF EXISTS public.calculate_app_productivity_name(timestamp without time zone, timestamp without time zone, text, text, text, text, text[]);
+
+CREATE OR REPLACE PROCEDURE public.calculate_app_productivity_name(
+	IN p_user_activity_from_date timestamp without time zone,
+	IN p_user_activity_to_date timestamp without time zone,
+	IN p_type text DEFAULT NULL::text,
+	IN p_location text DEFAULT NULL::text,
+	IN p_division text DEFAULT NULL::text,
+	IN p_project text DEFAULT NULL::text,
+	IN p_email text[] DEFAULT NULL::text[])
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    l_Application TEXT;
+    l_ActiveMinutes INTERVAL;
+    l_Productive TEXT;
+    email_id TEXT;
+	p_branch TEXT;
+	display_name TEXT;
+	alternative_name TEXT;
+	result_row RECORD;
+	app_row RECORD;
+BEGIN
+
+-- Create a temporary table to store aggregated data
+CREATE TEMPORARY TABLE temp_aggregated_data (
+	DisplayName TEXT,
+    Application TEXT,
+    ActiveMinutes INTERVAL,
+    Productive TEXT
+);
+
+FOR email_id IN SELECT UNNEST(p_email)
+LOOP       
+
+ SELECT "DisplayName" INTO display_name
+    FROM public."UserDatas"
+    WHERE "Email" = email_id;
+
+    -- Insert aggregated data into the temporary table
+    INSERT INTO temp_aggregated_data(DisplayName,Application, ActiveMinutes, Productive)
+    SELECT
+	    COALESCE(display_name, 'Unknown') AS DisplayName,
+        CASE
+                 WHEN app."ApplicationName" IS NULL OR pa."ApplicationId" IS NULL THEN 'Others'
+        ELSE COALESCE(app."ApplicationName", 'Others')
+    END AS Application,
+  
+        COALESCE(SUM(
+            CASE 
+                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 
+                THEN 0
+                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+            END
+        ) / 3600, 0) * INTERVAL '1 hour' AS ActiveMinutes,
+   
+    CASE
+        WHEN app."ApplicationName" IS NULL THEN 'false'
+        WHEN pa."Productive" THEN 'true'
+        ELSE 'false'
+    END AS Productive
+      
+    FROM (
+        SELECT 
+		
+            aa."ApplicationName" AS "Application",
+            aa."RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+            LEAD(aa."RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY aa."RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+        	FROM public."ActiveApplications" aa
+				left join public."UserDatas" ud on aa."UserActivityUserName" = ud."LocalADUserName"
+				WHERE 
+					(ud."Email" = email_id)
+					AND (p_location IS NULL OR ud."Location" = p_location OR p_location='')
+					AND (p_division IS NULL OR ud."Division" = p_division OR p_division='')
+-- 					AND (p_project IS NULL OR ud."Project" = p_project OR p_project='')
+					AND "ScreenshotPath" IS NOT NULL 
+					AND "UserActivityCurrentDateTime" >= p_user_activity_from_date 
+					AND "UserActivityCurrentDateTime" <= p_user_activity_to_date
+-- 					AND EXTRACT(ISODOW FROM aa."RecordDateTime") < 6
+					AND NOT EXISTS (
+					SELECT 1
+					FROM public."Holidays" h
+					WHERE h."Date"::DATE = aa."RecordDateTime"::DATE
+					AND h."Location" = p_location
+					AND h."Branch" = p_branch
+				)
+    ) AS RankedData
+
+LEFT JOIN public."ApplicationMaster" app ON LOWER(RankedData."Application") = LOWER(app."ApplicationName")
+LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId" 
+LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id" 
+WHERE
+    (
+        (p_type = 'productive' AND (pa."Productive" = TRUE OR app."ApplicationName" IS NULL)) OR
+        (p_type = 'unproductive' AND (pa."Productive" = FALSE OR app."ApplicationName" IS NULL)) OR
+        (p_type = 'all')
+    )
+       AND prj."ProjectName" = p_project
+     OR pa."ApplicationId" IS NULL
+      GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId";
+	
+		
+	
+END LOOP;
+
+
+
+FOR result_row IN 
+    SELECT COALESCE(am."AlternativeName", 'Others') AS Application,DisplayName, SUM(td.ActiveMinutes) AS TotalActiveMinutes, MAX(td.Productive) AS Productive
+    FROM temp_aggregated_data td
+    LEFT JOIN public."ApplicationMaster" am ON LOWER(td.Application) = LOWER(am."ApplicationName")
+    GROUP BY am."AlternativeName",DisplayName
+LOOP
+    -- Rename loop variables to avoid ambiguity
+	 display_name := result_row.DisplayName;
+    l_Application := result_row.Application;
+    l_ActiveMinutes := result_row.TotalActiveMinutes;
+    l_Productive := result_row.Productive;
+   
+
+    IF NOT (p_type = 'productive' AND l_Productive = 'false' AND l_Application = 'Others') THEN
+        RAISE NOTICE 'DisplayName: %, Application: %, ActiveMinutes: %, Productive: %',
+            display_name,
+            l_Application,
+            TO_CHAR(l_ActiveMinutes, 'HH24:MI:SS'),
+            l_Productive;
+    END IF;
+END LOOP;
+
+-- Drop the temporary table
+DROP TABLE IF EXISTS temp_aggregated_data;
+
+END;
+$BODY$;
+
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- PROCEDURE: public.check_user_logged(timestamp without time zone, timestamp without time zone, timestamp without time zone, timestamp without time zone)
+
+-- DROP PROCEDURE IF EXISTS public.check_user_logged(timestamp without time zone, timestamp without time zone, timestamp without time zone, timestamp without time zone);
+
+CREATE OR REPLACE PROCEDURE public.check_user_logged(
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone,
+	p_startrange timestamp without time zone,
+	p_endrange timestamp without time zone)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+
+    ud_record RECORD;
+    has_activity BOOLEAN;
+    user_displayname text;
+   last_activity_date text;
+    user_job_title text;
+		user_email TEXT;
+	ReportingEmail TEXT;
+	is_weekend_or_holiday BOOLEAN;
+	Shift_Time TEXT;
+	reporting_emails TEXT;
+BEGIN
+    
+	
+	 SELECT EXISTS (
+        SELECT 1
+        FROM generate_series(p_user_activity_from_date::date, p_user_activity_to_date::date, '1 day'::interval) as dates
+        WHERE EXTRACT(ISODOW FROM dates) IN (6, 7) OR EXISTS (
+            SELECT 1
+            FROM public."Holidays" h
+            WHERE h."Date" = dates::DATE
+        )
+    ) INTO is_weekend_or_holiday;
+
+    -- If the date range includes a weekend or holiday, exit the procedure
+    IF is_weekend_or_holiday THEN
+        RAISE NOTICE 'The specified date range includes a weekend or holiday. No records to process.';
+        RETURN;
+    END IF;
+
+  
+ 
+ 
+        -- If Admin, display data for all users
+         FOR ud_record IN (
+                    SELECT DISTINCT ON ("Email") "LocalADUserName","LocalADDomain","JobTitle", "DisplayName",
+			 "Email","ReportingIntoMail","ShiftStartTime","ShiftEndTime"
+                    FROM "UserDatas" Where "isDelete"  = false
+                ) LOOP
+				
+				 reporting_emails := ''; -- Initialize reporting_emails
+				     WITH RECURSIVE ReportingCTE AS (
+            SELECT "Email", "ReportingIntoMail"
+            FROM "UserDatas"
+            WHERE "Email" = ud_record."Email"
+            UNION
+            SELECT ud."Email", ud."ReportingIntoMail"
+            FROM "UserDatas" ud
+            INNER JOIN ReportingCTE rc ON ud."Email" = rc."ReportingIntoMail"
+        )
+        SELECT STRING_AGG("ReportingIntoMail", ',') INTO reporting_emails
+        FROM ReportingCTE
+        WHERE "ReportingIntoMail" IS NOT NULL;
+                   SELECT EXISTS (
+                        SELECT 1
+                        FROM public."ActiveApplications" aa
+                			LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" 
+							
+					 WHERE (ud."Email" = ud_record."Email")
+      AND "UserActivityCurrentDateTime" >= p_user_activity_from_date 
+      AND "UserActivityCurrentDateTime" <= p_user_activity_to_date 
+      AND "ScreenshotPath" IS NOT NULL 
+ 
+                      
+                           
+				
+                    ) INTO has_activity;
+					
+				
+
+                    -- Exclude user if any of the usernames have activity
+                   IF NOT has_activity THEN
+					   SELECT MAX("RecordDateTime")
+                INTO last_activity_date
+                FROM public."ActiveApplications" aa
+                LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" 
+                WHERE ud."Email" = ud_record."Email"
+                    AND "UserActivityCurrentDateTime" < p_user_activity_from_date
+                    AND aa."ScreenshotPath" IS NOT NULL
+					   AND to_timestamp(ud."ShiftStartTime", 'HH24:MI')::time 
+          BETWEEN p_startrange::time AND p_endrange::time ;
+				
+			 shift_time := CONCAT(ud_record."ShiftStartTime", ' - ', ud_record."ShiftEndTime");
+					
+					IF last_activity_date IS NOT NULL Then
+                        RAISE NOTICE ' DisplayName: %, UserName: %, Domain: %, JobTitle: %, Last Date: %, ReportingIntoMail: %, ShiftTime: %',
+                            ud_record."DisplayName",ud_record."LocalADUserName",ud_record."LocalADDomain",ud_record."JobTitle","last_activity_date",
+							reporting_emails,shift_time;
+					END IF;
+                    END IF;
+            
+            END LOOP;
+      
+		
+		
+       
+     
+  
+   
+END;
+
+  
+
+$BODY$;
+
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+-- PROCEDURE: public.check_useragent_activity()
+
+-- DROP PROCEDURE IF EXISTS public.check_useragent_activity();
+
+CREATE OR REPLACE PROCEDURE public.check_useragent_activity(
+	)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+ 
+    user_displayname TEXT;
+    Domain_Name TEXT;
+	project_Name TEXT;
+    ud_record RECORD;
+ last_current_datetime TIMESTAMP WITHOUT TIME ZONE := NULL;
+working_status TEXT;  
+-- 	 today DATE := CURRENT_DATE;
+ today TIMESTAMP WITHOUT TIME ZONE := now();
+    
+BEGIN
+   
+
+    
+    FOR ud_record IN (
+        SELECT   "LocalADUserName", "LocalADDomain", "JobTitle", "DisplayName","ProjectId"
+        FROM "UserDatas" Where "isDelete" = false
+    ) LOOP
+
+        -- Fetch the last current datetime for the user
+        last_current_datetime := (
+            SELECT MAX(ua."CurrentDateTime")
+            FROM "UserLoggingActivity" ua
+           WHERE ua."UserName" = ud_record."LocalADUserName"
+         
+        );
+
+
+
+           -- Determine the working status based on last_current_datetime
+        IF last_current_datetime + INTERVAL '4 minutes' < today THEN
+            working_status := 'FALSE';
+        ELSE
+            working_status := 'TRUE';
+        END IF;
+
+         SELECT "ProjectName" INTO project_name
+                       FROM "ProjectMaster"
+                       WHERE "Id" = ud_record."ProjectId"; 
+        
+		
+		
+     IF last_current_datetime is Not NULL Then
+        -- Raise notice for the last available date
+        RAISE NOTICE 'DisplayName: %, Project: %, Username: %, Domain: %, LastCurrentDateTime: %, WorkingStatus: %',
+            ud_record."DisplayName",
+			project_name,
+            ud_record."LocalADUserName",
+            ud_record."LocalADDomain",
+            last_current_datetime,
+            working_status;
+			END IF;
+    END LOOP;
+END;
+$BODY$;
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- PROCEDURE: public.user_login_status(text, text, text, timestamp without time zone, timestamp without time zone)
+
+-- DROP PROCEDURE IF EXISTS public.user_login_status(text, text, text, timestamp without time zone, timestamp without time zone);
+
+
+CREATE OR REPLACE PROCEDURE public.user_login_status(
+	p_email text,
+	p_user_roles text,
+	p_time text,
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+    user_record RECORD;
+    ud_record RECORD;
+    user_displayname TEXT;
+	project_name TEXT;
+    user_role TEXT;
+    user_job_title TEXT;
+    check_date TIMESTAMP WITHOUT TIME ZONE := p_user_activity_from_date;
+    has_activity BOOLEAN;
+	shift_time TEXT;
+
+BEGIN
+     
+-- 
+	
+    WHILE check_date <= p_user_activity_to_date LOOP
+        IF EXTRACT(ISODOW FROM check_date) IN (6, 7) OR EXISTS (
+            SELECT 1
+            FROM public."Holidays" h
+            WHERE h."Date"::DATE = check_date::DATE
+        ) THEN
+            -- Skip processing for weekends and holidays
+            check_date := check_date + INTERVAL '1 day'; -- Move to the next day
+            CONTINUE; -- Skip the rest of the loop for weekends and holidays
+        END IF;
+
+
+
+        IF POSITION('Admin' IN p_user_roles) > 0 THEN
+   
+
+			
+			   FOR ud_record IN
+             SELECT DISTINCT ON ("Email") "Email", "DisplayName","ProjectId","JobTitle","ShiftStartTime","ShiftEndTime"
+               FROM "UserDatas"
+			    WHERE "isDelete" = false
+               LOOP
+                
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM public."ActiveApplications" aa
+                			LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"
+							WHERE 
+							(ud."Email" = ud_record."Email")	
+                            AND "RecordDateTime" >= check_date AND
+                            "RecordDateTime" < check_date + INTERVAL '1 day' AND
+--                             EXTRACT(HOUR FROM "RecordDateTime") < 08.35 AND
+						   "RecordDateTime"::TIME < CAST(p_time AS TIME) AND
+                            "UserActivityCurrentDateTime" BETWEEN check_date AND p_user_activity_to_date AND
+                            "ScreenshotPath" IS NOT NULL
+                    ) INTO has_activity;
+
+                    -- Exclude user if any of the usernames have activity
+                    IF NOT has_activity THEN
+					
+					   SELECT "ProjectName" INTO project_name
+                       FROM "ProjectMaster"
+                       WHERE "Id" = ud_record."ProjectId";
+			
+                          shift_time := CONCAT(ud_record."ShiftStartTime", ' - ', ud_record."ShiftEndTime");
+			
+                          RAISE NOTICE 'Date: %, DisplayName: %, Project: %, JobTitle: %, HasActivity: %, ShiftTime: %',
+                check_date, ud_record."DisplayName", project_name, ud_record."JobTitle", has_activity::TEXT
+				,shift_time;
+                    END IF;
+                END LOOP;
+				
+            ELSE
+			
+			-- Manager Hierarchy
+			
+
+
+         IF POSITION('Manager' IN p_user_roles) > 0 THEN
+			
+                FOR ud_record IN (
+                    WITH RECURSIVE OrgHierarchy AS (
+						SELECT "Email", "JobTitle","ProjectId","DisplayName","ShiftStartTime","ShiftEndTime",  1 AS level
+						FROM "UserDatas"
+						WHERE "Email" = p_email and  "isDelete" = false
+
+						UNION ALL
+
+						SELECT ud."Email", ud."JobTitle",ud."ProjectId",ud."DisplayName",ud."ShiftStartTime",ud."ShiftEndTime",  oh.level + 1
+						FROM "UserDatas" ud
+						JOIN OrgHierarchy oh ON ud."ReportingIntoMail" = oh."Email"
+					)
+					SELECT DISTINCT ON (oh."Email") oh."JobTitle",oh."ProjectId",oh."DisplayName", oh."Email",oh."ShiftStartTime",oh."ShiftEndTime"
+					FROM OrgHierarchy oh
+					ORDER BY oh."Email", oh.level DESC
+				) LOOP
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM public."ActiveApplications" aa
+                			LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName"
+							WHERE 
+							(ud."Email" = ud_record."Email") AND 
+                            DATE_TRUNC('day', "RecordDateTime") = DATE_TRUNC('day', check_date) AND
+                            "UserActivityCurrentDateTime" >= p_user_activity_from_date AND
+                            "UserActivityCurrentDateTime" <= p_user_activity_to_date AND
+--                             EXTRACT(HOUR FROM "RecordDateTime") < 11 AND
+						"RecordDateTime"::TIME < CAST(p_time AS TIME) AND
+                            "ScreenshotPath" IS NOT NULL
+                    ) INTO has_activity;
+
+                    -- Exclude user if any of the usernames have activity
+                    IF NOT has_activity THEN
+					
+					 SELECT "ProjectName" INTO project_name
+                       FROM "ProjectMaster"
+                       WHERE "Id" = ud_record."ProjectId"; 
+					   
+                     shift_time := CONCAT(ud_record."ShiftStartTime", ' - ', ud_record."ShiftEndTime");
+			
+                          RAISE NOTICE 'Date: %, DisplayName: %, Project: %, JobTitle: %, HasActivity: %, ShiftTime: %',
+                check_date, ud_record."DisplayName", project_name, ud_record."JobTitle", has_activity::TEXT
+				,shift_time;
+                    END IF;
+                END LOOP;
+				END IF;
+            END IF;
+        
+        check_date := check_date + INTERVAL '1 day';
+    END LOOP;
+END;
+$BODY$;
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE public.calculate_user_average_hours(
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+active_record RECORD;
+    ud_record RECORD;
+    date_record DATE;
+    working_hours NUMERIC;
+    productive_minutes NUMERIC;
+    non_productive_minutes NUMERIC;
+    logged_hours NUMERIC;
+    idle_hours NUMERIC;
+    adjusted_from_date timestamp without time zone;
+    adjusted_to_date timestamp without time zone;
+	reporting_emails TEXT;
+BEGIN
+
+
+ IF EXTRACT(DOW FROM p_user_activity_from_date) = 1 THEN -- If the given date is Monday
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '7 days';
+    ELSE
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '1 day' * (EXTRACT(DOW FROM p_user_activity_from_date) - 1);
+    END IF;
+    adjusted_to_date := adjusted_from_date + INTERVAL '6 days';
+
+    FOR ud_record IN (
+        SELECT DISTINCT ON ("Email") "Email", "DisplayName", "ProjectId", "JobTitle", "ReportingIntoMail","LocalADUserName"
+        FROM "UserDatas"
+        WHERE "isDelete" = false	
+    ) LOOP
+
+
+	
+	      reporting_emails := ''; -- Initialize reporting_emails
+
+        -- Fetch reporting emails hierarchy using recursive CTE
+        WITH RECURSIVE ReportingCTE AS (
+            SELECT "Email", "ReportingIntoMail"
+            FROM "UserDatas"
+            WHERE "Email" = ud_record."Email"
+            UNION
+            SELECT ud."Email", ud."ReportingIntoMail"
+            FROM "UserDatas" ud
+            INNER JOIN ReportingCTE rc ON ud."Email" = rc."ReportingIntoMail"
+        )
+        SELECT STRING_AGG("ReportingIntoMail", ',') INTO reporting_emails
+        FROM ReportingCTE
+        WHERE "ReportingIntoMail" IS NOT NULL;
+
+        FOR date_record IN
+            SELECT generate_series(adjusted_from_date::date, adjusted_to_date::date, '1 day')::date
+        LOOP
+            -- Skip weekends and holidays
+          
+                -- Calculate productive and non-productive minutes for the current day
+                productive_minutes := 0;
+                non_productive_minutes := 0;
+                
+                FOR active_record IN (
+                    SELECT
+                        CASE 
+                            WHEN app."ApplicationName" IS NULL THEN 'Others'
+                            ELSE COALESCE(app."ApplicationName", 'Others')
+                        END AS application_name,
+                        COALESCE(SUM(CASE
+                            WHEN app."ApplicationName" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+                            ELSE 0
+                        END) / 3600, 0) AS productive_minutes,
+                        COALESCE(SUM(CASE
+                            WHEN app."ApplicationName" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+                            ELSE 0
+                        END) / 3600, 0) AS non_productive_minutes
+                    FROM (
+                        SELECT 
+                            ActiveApplications."ApplicationName" AS "ApplicationName",
+                            CASE 
+                                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+                            END AS active_seconds,
+                            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+                        FROM (
+                            SELECT 
+                                "ApplicationName",
+                                "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                                LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                            FROM public."ActiveApplications" aa 
+                            LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" and aa."UserActivityDomainName" = ud."LocalADDomain"
+                            WHERE 
+                                (ud."Email" = ud_record."Email")
+                                AND DATE("UserActivityCurrentDateTime") = date_record
+                                AND "ScreenshotPath" IS NOT NULL
+                               
+                        ) AS ActiveApplications
+                    ) AS ActivityIntervals
+                    LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName") = LOWER(app."ApplicationName")
+                    LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+                    LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id"
+                    WHERE prj."Id" = ud_record."ProjectId"
+                       OR pa."ApplicationId" IS NULL
+                    GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId"
+
+                ) LOOP
+                    IF active_record.application_name = 'Others' THEN
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    ELSE
+                        productive_minutes := productive_minutes + active_record.productive_minutes;
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    END IF;
+                END LOOP;
+
+  
+
+                -- Calculate Logged Hours
+                SELECT COALESCE(SUM(CASE
+                    WHEN DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time) THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+                    ELSE 0
+                END), 0)
+                INTO logged_hours
+                FROM (
+                    SELECT 
+                        "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                        LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+                    FROM public."ActiveApplications" aa
+                    LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" AND aa."UserActivityDomainName" = ud."LocalADDomain"
+                    WHERE 
+                        (ud."Email" = ud_record."Email")
+                        AND DATE("UserActivityCurrentDateTime") = date_record
+                        AND "ScreenshotPath" IS NOT NULL
+                       
+                ) AS LoggedData;
+
+                -- Calculate Working Hours
+                working_hours := productive_minutes + non_productive_minutes;
+
+                -- Calculate Idle Hours
+                idle_hours := logged_hours - working_hours;
+
+                
+                -- Raise notice with user details and working hours for the current day
+                RAISE NOTICE 'Date: %, User: %, Mail: %, ReportingTo: %, WorkingHours: %, ProductiveHours: %, NonProductiveHours: %, LoggedHours: %, IdleHours: %',
+                    date_record,
+                    ud_record."DisplayName",
+                    ud_record."Email",
+					reporting_emails,
+                    TO_CHAR(INTERVAL '1 hour' * working_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * non_productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * logged_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * idle_hours, 'HH24:MI:SS');
+            
+            
+			
+        END LOOP;
+
+    END LOOP;
+END;
+$BODY$;
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+CREATE OR REPLACE PROCEDURE public.calculate_user_consolidation(
+	p_user_activity_from_date timestamp without time zone,
+	p_user_activity_to_date timestamp without time zone)
+LANGUAGE 'plpgsql'
+AS $BODY$
+DECLARE
+active_record RECORD;
+    ud_record RECORD;
+    date_record DATE;
+    working_hours NUMERIC;
+    productive_minutes NUMERIC;
+    non_productive_minutes NUMERIC;
+    logged_hours NUMERIC;
+    idle_hours NUMERIC;
+    adjusted_from_date timestamp without time zone;
+    adjusted_to_date timestamp without time zone;
+	
+
+BEGIN
+
+ IF EXTRACT(DOW FROM p_user_activity_from_date) = 1 THEN -- If the given date is Monday
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '7 days';
+    ELSE
+        adjusted_from_date := p_user_activity_from_date - INTERVAL '1 day' * (EXTRACT(DOW FROM p_user_activity_from_date) - 1);
+    END IF;
+    adjusted_to_date := adjusted_from_date + INTERVAL '6 days';
+
+    FOR ud_record IN (
+        SELECT DISTINCT ON ("Email") "Email", "DisplayName", "ProjectId", "JobTitle", "ReportingIntoMail","LocalADUserName"
+        FROM "UserDatas"
+        WHERE "isDelete" = false	
+    ) LOOP
+
+	
+	     
+
+      
+
+        FOR date_record IN
+            SELECT generate_series(adjusted_from_date::date, adjusted_to_date::date, '1 day')::date
+        LOOP
+      
+                -- Calculate productive and non-productive minutes for the current day
+                productive_minutes := 0;
+                non_productive_minutes := 0;
+                
+                FOR active_record IN (
+                  	  SELECT
+		   CASE 
+		        WHEN app."ApplicationName" IS NULL OR pa."ApplicationId" IS NULL THEN 'Others'
+		        ELSE COALESCE(app."ApplicationName", 'Others')
+		    END AS application_name,
+		    COALESCE(SUM(CASE
+		        WHEN pa."ApplicationId" IS NULL OR pa."Productive" THEN ActivityIntervals.active_seconds
+		        ELSE 0
+		    END) / 3600, 0) AS productive_minutes,
+		    COALESCE(SUM(CASE
+		        WHEN pa."ApplicationId" IS NULL OR NOT pa."Productive" THEN ActivityIntervals.active_seconds
+		        ELSE 0
+		    END) / 3600, 0) AS non_productive_minutes
+                    FROM (
+                        SELECT 
+                            ActiveApplications."ApplicationName" AS "ApplicationName",
+                            CASE 
+                                WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 0
+                                ELSE EXTRACT(EPOCH FROM (next_time - record_date_time))
+                            END AS active_seconds,
+                            SUM(CASE WHEN EXTRACT(EPOCH FROM (next_time - record_date_time)) >= 300 THEN 1 ELSE 0 END)
+                                OVER (ORDER BY record_date_time AT TIME ZONE 'UTC') AS group_id
+                        FROM (
+                            SELECT 
+                                "ApplicationName",
+                                "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                                LEAD("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS next_time
+                            FROM public."ActiveApplications" aa 
+                            LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" and aa."UserActivityDomainName" = ud."LocalADDomain"
+                            WHERE 
+                                (ud."Email" = ud_record."Email")
+                                AND DATE("UserActivityCurrentDateTime") = date_record
+                                AND "ScreenshotPath" IS NOT NULL
+                               
+                        ) AS ActiveApplications
+                    ) AS ActivityIntervals
+                    LEFT JOIN public."ApplicationMaster" app ON LOWER(ActivityIntervals."ApplicationName") = LOWER(app."ApplicationName")
+                    LEFT JOIN public."ProjectApplications" pa ON app."Id" = pa."ApplicationId"
+                    LEFT JOIN public."ProjectMaster" prj ON pa."ProjectId" = prj."Id"
+                    WHERE prj."Id" = ud_record."ProjectId"
+                   OR pa."ApplicationId" IS NULL
+             GROUP BY app."ApplicationName", pa."Productive", pa."ApplicationId" 
+                ) LOOP
+                    IF active_record.application_name = 'Others' THEN
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    ELSE
+                        productive_minutes := productive_minutes + active_record.productive_minutes;
+                        non_productive_minutes := non_productive_minutes + active_record.non_productive_minutes;
+                    END IF;
+                END LOOP;
+
+                -- Calculate Logged Hours
+                SELECT COALESCE(SUM(CASE
+                    WHEN DATE_TRUNC('day', record_date_time) = DATE_TRUNC('day', previous_time) THEN EXTRACT(EPOCH FROM (record_date_time AT TIME ZONE 'UTC' - previous_time AT TIME ZONE 'UTC')) / 3600
+                    ELSE 0
+                END), 0)
+                INTO logged_hours
+                FROM (
+                    SELECT 
+                        "RecordDateTime" AT TIME ZONE 'UTC' AS record_date_time,
+                        LAG("RecordDateTime" AT TIME ZONE 'UTC') OVER (ORDER BY "RecordDateTime" AT TIME ZONE 'UTC') AS previous_time
+                    FROM public."ActiveApplications" aa
+                    LEFT JOIN public."UserDatas" ud ON aa."UserActivityUserName" = ud."LocalADUserName" AND aa."UserActivityDomainName" = ud."LocalADDomain"
+                    WHERE 
+                        (ud."Email" = ud_record."Email")
+                        AND DATE("UserActivityCurrentDateTime") = date_record
+                        AND "ScreenshotPath" IS NOT NULL
+                       
+                ) AS LoggedData;
+
+                -- Calculate Working Hours
+                working_hours := productive_minutes + non_productive_minutes;
+
+                -- Calculate Idle Hours
+                idle_hours := logged_hours - working_hours;
+
+                
+                -- Raise notice with user details and working hours for the current day
+                RAISE NOTICE 'Date: %, User: %, Mail: %, ReportingTo: %, WorkingHours: %, ProductiveHours: %, NonProductiveHours: %, LoggedHours: %, IdleHours: %',
+                    date_record,
+                    ud_record."DisplayName",
+                    ud_record."Email",
+					ud_record."ReportingIntoMail",
+                  TO_CHAR(INTERVAL '1 hour' * working_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * non_productive_minutes, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * logged_hours, 'HH24:MI:SS'),
+                    TO_CHAR(INTERVAL '1 hour' * idle_hours, 'HH24:MI:SS');
+          
+
+			
+        END LOOP;
+
+    END LOOP;
+END;
+$BODY$;
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------

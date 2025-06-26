@@ -1,0 +1,129 @@
+version: "3.3"
+services:
+  postgres:
+    image: postgres:14.6
+    environment:
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_DB=${DB_NAME}
+      - TZ=Asia/Kolkata
+      - PGTZ=Asia/Kolkata
+    volumes:
+      - "../db_data/db_init.sql:/docker-entrypoint-initdb.d/"
+      - "../db_data/data:/var/lib/postgresql/data/"
+
+    restart: always
+    networks:
+      - etrk_backend
+
+  pgadmin_web:
+    restart: always
+    container_name: pgadmin_web
+    image: dpage/pgadmin4:8.1
+    volumes:
+      - ../pgadmin_data:/var/lib/pgadmin
+
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD}
+      - PGADMIN_DISABLE_POSTFIX=true
+      - PGADMIN_LISTEN_ADDRESS=0.0.0.0
+      - PGADMIN_LISTEN_PORT=80
+      - SCRIPT_NAME=/pgadmin4
+      - PGADMIN_CONFIG_PROXY_X_FOR_COUNT=2
+      - PGADMIN_CONFIG_PROXY_X_PROTO_COUNT=2
+      - PGADMIN_CONFIG_PROXY_X_HOST_COUNT=2
+      - PGADMIN_CONFIG_PROXY_X_PORT_COUNT=2
+      - X_CONTENT_TYPE_OPTIONS=""
+      - ENHANCED_COOKIE_PROTECTION=False
+      - X_XSS_PROTECTION="0"
+    networks:
+      - etrk_backend
+
+  etrkserver:
+    build:
+      context: ./eTrkServer
+    environment:
+      - "ConnectionStrings__DefaultConnection=Server=postgres;Port=${DB_PORT};Database=${DB_NAME};Username=${DB_USER};Password=${DB_PASSWORD};"
+      - "JwtAuthentication__Issuer=${URL}"
+      - "JwtAuthentication__SecretKey=${JWT_KEY}"
+      - "CorsSettings__AllowedOrigins=[${URL}]"
+      - "ResetPassword__RedirectUrl=${URL}/#"
+      - "EncryptionKey=${AGENT_KEY}"
+      - "Mail__MailAddress=${MAIL_ADDRESS}"
+      - "Mail__Password=${MAIL_PASSWORD}"
+      - "Mail__HostName=${MAIL_HOSTNAME}"
+      - "Mail__Port=${MAIL_PORT}"
+      - "NonLoggedNotification__Morning=${MORNINGHOURUTC}"
+      - "NonLoggedNotification__Afternoon=${AFTERNOONHOURUTC}"
+      - "AgentNotification__Morning=${MORNINGHOURUTC}"
+      - "AgentNotification__Afternoon=${AFTERNOONHOURUTC}"
+      - "AgentNotification__Evening=${EVENINGHOURUTC}"
+      - "AverageHoursNotification__ExecutionHourUtc=${AVERAGEHOURUTC}"
+      - "AverageHoursNotification__ExecutionMinuteUtc=${AVERAGEMINUTEUTC}"
+      - "AverageHoursNotification__ExecutionSecondUtc=${AVERAGESECONDUTC}"
+      - "ConsolidationAverageHours__ExecutionHourUtc=${CONSOLIDATEHOURUTC}"
+      - "ConsolidationAverageHours__ExecutionMinuteUtc=${CONSOLIDATEMINUTEUTC}"
+      - "ConsolidationAverageHours__ExecutionSecondUtc=${CONSOLIDATESECONDUTC}"
+      - "Extension&Software__EmailNotification=${EMAIL_NOTIFICATION}"
+      - "SysTeam__TargetEmail=${EMAIL}"
+      - "AverageHours__Hours=${HOURS}"
+      - "CC__MailAddresses=${CC_EMAIL}"
+      - "ResetEmail__ExpiryMinutes=${EXPIRYMINUTES}"
+      - "DefaultPassword__Password=${DEFAULT_PASSWORD}"
+    volumes:
+      - "../Screenshots:/Screenshots"
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+
+    restart: always
+    depends_on:
+      - postgres
+    links:
+      - postgres
+    networks:
+      - etrk_backend
+
+  etrkwebportal:
+    build:
+      context: ./eTrkWebPortal
+    restart: always
+    depends_on:
+      - etrkserver
+    links:
+      - etrkserver
+    networks:
+      - etrk_frontend
+
+  etrkvideoapi:
+    build:
+      context: ./eTrkVideoApi
+    volumes:
+      - "../Screenshots:/Screenshots"
+    depends_on:
+      - etrkserver
+    restart: always
+    links:
+      - etrkserver
+    networks:
+      - etrk_backend
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "80:80" # Change if you need
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+    networks:
+      - etrk_backend
+      - etrk_frontend
+    links:
+      - etrkserver
+      - pgadmin_web
+      - etrkwebportal
+
+networks:
+  etrk_backend:
+    driver: bridge
+  etrk_frontend:
+    driver: bridge

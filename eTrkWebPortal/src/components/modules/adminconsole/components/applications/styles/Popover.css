@@ -1,0 +1,73 @@
+.data-grid-header-cell {
+   background-color: #444791;
+    color: white;
+    font-weight: bold;
+  }
+
+.table-container {
+    max-height: 10px; 
+    overflow-y: auto;
+}
+.styles {
+  color: #6b7280 !important;
+}
+
+.popover-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  overflow: hidden;
+}
+.pill-117 {
+  outline: transparent;
+  position: relative;
+  font-size: 20px;
+  box-sizing: border-box;
+  width: 40px;
+  height: 20px;
+  border-radius: 10px;
+  transition: all 0.1s ease 0s;
+  border:1px solid transparent;
+  background: rgb(0, 120, 212);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 0px 3px;
+  overflow: visible;
+  justify-content: flex-end;
+}
+.f10nrhrw {
+  box-shadow: var(--shadow64);
+  background: white;
+  border-radius: 5px;
+  border: none;
+}
+.popover-header-left {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.popover-header-right {
+  margin-left: auto;
+  display: flex;
+  justify-content: flex-end;
+}
+
+
+
+
+
+
+/* Add more styles as needed */
+
+
+.text-170{
+  color: #6b7280;
+}
+
+.table-container {
+  max-height: 180px;
+  overflow-y: auto; 
+
+}
+
