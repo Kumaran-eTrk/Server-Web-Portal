@@ -296,7 +296,7 @@ Kindly check the database in pgAdmin after starting the Docker server to verify 
         INSERT INTO "UsersRoles" ("RoleId","useremail","ModifiedBy","ModifiedDatetime")
         VALUES ('1','user@gmail.com',NULL,'2025-03-20 11:27:29');
 
-### 6).Holidays Table :
+### 6).Holidays Table:
 
         INSERT INTO "Holidays" ("Id", "Holiday", "Date", "Location", "Branch", "ModifiedBy", "ModifiedTime")
         VALUES ('5dcf57-87d2-4a4a-bad5-c3468bc7f93e','New year', '2025-01-01 ', 'India', 'Chennai', NULL, NULL);
